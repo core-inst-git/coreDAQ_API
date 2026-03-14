@@ -135,6 +135,16 @@ class CoreDAQ:
         self._linear_zero_adc: List[int] = [0, 0, 0, 0]
 
         # ====== LOG LUT storage ======
+        self._loglut_by_head: List[Dict[str, object]] = [
+            {
+                "V_V": None,
+                "log10P": None,
+                "V_mV": None,
+                "log10P_Q16": None,
+            }
+            for _ in range(self.NUM_HEADS)
+        ]
+        # Backward-compatible aliases for channel 1 LUT.
         self._loglut_V_V: Optional[List[float]] = None
         self._loglut_log10P: Optional[List[float]] = None
         self._loglut_V_mV: Optional[List[int]] = None
@@ -154,17 +164,6 @@ class CoreDAQ:
         self._silicon_log_iz_a: float = self.DEFAULT_SILICON_LOG_IZ_A
         self._silicon_linear_tia_ohm: List[List[float]] = self._build_default_tia_ohm_table()
 
-        # ---- Fast-path caches (NumPy transfer_frames_W) ----
-        self._fast_linear_slope = [[0.0 for _ in range(self.NUM_GAINS)] for _ in range(self.NUM_HEADS)]
-        self._fast_linear_intercept = [[0.0 for _ in range(self.NUM_GAINS)] for _ in range(self.NUM_HEADS)]
-        self._fast_linear_power_lsb = [[0.0 for _ in range(self.NUM_GAINS)] for _ in range(self.NUM_HEADS)]
-        self._fast_linear_decimals = [[0 for _ in range(self.NUM_GAINS)] for _ in range(self.NUM_HEADS)]
-        self._fast_linear_corr = 1.0
-        self._fast_log_corr = 1.0
-        self._fast_loglut_V = None
-        self._fast_loglut_log10P = None
-        self._fast_silicon_resp = 1.0
-
         # Load I2C state and calibration tables
         self.i2c_refresh()
         self._load_calibration_for_frontend()
@@ -176,15 +175,12 @@ class CoreDAQ:
         # Build silicon fallback TIA estimates from loaded LINEAR calibration when available.
         self._bootstrap_silicon_tia_from_linear_cal()
 
-        self._rebuild_fast_tables()
-
         # Load bundled responsivity curves if present.
         resp_path = os.path.join(os.path.dirname(__file__), "responsivity_curves.json")
         if os.path.exists(resp_path):
             try:
                 self.load_responsivity_curves_json(resp_path)
                 self._bootstrap_silicon_tia_from_linear_cal()
-                self._rebuild_fast_tables()
             except Exception:
                 # Keep API usable even if responsivity file is malformed/missing.
                 pass
@@ -333,7 +329,6 @@ class CoreDAQ:
         self._detector_type = self._normalize_detector_type(detector)
         # Enforce detector-specific wavelength bounds after type change.
         self.set_wavelength_nm(self._wavelength_nm)
-        self._rebuild_fast_tables()
 
     def _detector_wavelength_limits_nm(self, detector: Optional[str] = None) -> Tuple[float, float]:
         det = self._detector_type if detector is None else self._normalize_detector_type(detector)
@@ -360,7 +355,6 @@ class CoreDAQ:
                 stacklevel=2,
             )
         self._wavelength_nm = clamped
-        self._rebuild_fast_tables()
 
     def get_wavelength_nm(self) -> float:
         return float(self._wavelength_nm)
@@ -416,7 +410,6 @@ class CoreDAQ:
 
         self._resp_curve_nm = parsed_nm
         self._resp_curve_aw = parsed_aw
-        self._rebuild_fast_tables()
 
     def _interp_responsivity_aw(self, detector: str, wavelength_nm: float) -> float:
         det = self._normalize_detector_type(detector)
@@ -466,68 +459,6 @@ class CoreDAQ:
             return 1.0
         return max(0.0, float(r_ref) / float(r_now))
 
-    def _rebuild_fast_tables(self) -> None:
-        """Rebuild cached conversion constants for fast NumPy paths."""
-        try:
-            self._fast_log_corr = float(self._ingaas_responsivity_correction_factor())
-        except Exception:
-            self._fast_log_corr = 1.0
-
-        try:
-            self._fast_silicon_resp = float(self._interp_responsivity_aw(self.DETECTOR_SILICON, self._wavelength_nm))
-        except Exception:
-            self._fast_silicon_resp = 1.0
-
-        if self._loglut_V_V is not None and self._loglut_log10P is not None:
-            if _HAS_NUMPY:
-                self._fast_loglut_V = np.asarray(self._loglut_V_V, dtype=np.float64)
-                self._fast_loglut_log10P = np.asarray(self._loglut_log10P, dtype=np.float64)
-            else:
-                self._fast_loglut_V = None
-                self._fast_loglut_log10P = None
-        else:
-            self._fast_loglut_V = None
-            self._fast_loglut_log10P = None
-
-        if self._detector_type == self.DETECTOR_INGAAS:
-            try:
-                self._fast_linear_corr = float(self._ingaas_responsivity_correction_factor())
-            except Exception:
-                self._fast_linear_corr = 1.0
-
-            for h in range(self.NUM_HEADS):
-                for g in range(self.NUM_GAINS):
-                    slope = float(self._cal_slope[h][g])
-                    intercept = float(self._cal_intercept[h][g])
-                    self._fast_linear_slope[h][g] = slope
-                    self._fast_linear_intercept[h][g] = intercept
-                    if slope == 0.0:
-                        self._fast_linear_power_lsb[h][g] = 0.0
-                        self._fast_linear_decimals[h][g] = 0
-                        continue
-                    power_lsb = self.ADC_LSB_MV / abs(slope)
-                    power_lsb *= max(0.0, self._fast_linear_corr)
-                    self._fast_linear_power_lsb[h][g] = power_lsb
-                    self._fast_linear_decimals[h][g] = self._power_decimals_from_step(power_lsb)
-
-        elif self._detector_type == self.DETECTOR_SILICON:
-            resp = float(self._fast_silicon_resp)
-            for h in range(self.NUM_HEADS):
-                for g in range(self.NUM_GAINS):
-                    tia = float(self._silicon_linear_tia_ohm[h][g])
-                    self._fast_linear_slope[h][g] = 0.0
-                    self._fast_linear_intercept[h][g] = 0.0
-                    if resp <= 0.0 or tia <= 0.0:
-                        self._fast_linear_power_lsb[h][g] = 0.0
-                        self._fast_linear_decimals[h][g] = 0
-                        continue
-                    power_lsb = self.ADC_LSB_VOLTS / abs(tia * resp)
-                    self._fast_linear_power_lsb[h][g] = power_lsb
-                    self._fast_linear_decimals[h][g] = self._power_decimals_from_step(power_lsb)
-
-        else:
-            self._fast_linear_corr = 1.0
-
     def _bootstrap_silicon_tia_from_linear_cal(self) -> None:
         """
         Estimate per-channel/per-gain effective transimpedance (ohms) from LINEAR calibration:
@@ -550,8 +481,6 @@ class CoreDAQ:
                 tia = abs(slope) / (1000.0 * r_ref)
                 if math.isfinite(tia) and tia > 0.0:
                     self._silicon_linear_tia_ohm[h][g] = float(tia)
-
-        self._rebuild_fast_tables()
 
     def set_silicon_linear_tia_ohm(self, head: int, gain: int, tia_ohm: float) -> None:
         if head not in (1, 2, 3, 4):
@@ -579,12 +508,11 @@ class CoreDAQ:
             raise ValueError("iz_a must be > 0")
         self._silicon_log_vy_v_per_decade = vy
         self._silicon_log_iz_a = iz
-        self._rebuild_fast_tables()
 
     def get_silicon_log_model(self) -> Tuple[float, float]:
         return float(self._silicon_log_vy_v_per_decade), float(self._silicon_log_iz_a)
 
-    def _convert_log_voltage_to_power_w(self, v_volts: float) -> float:
+    def _convert_log_voltage_to_power_w(self, v_volts: float, head_idx: int = 1) -> float:
         if self._detector_type == self.DETECTOR_SILICON:
             # ADL5303 model:
             #   Vout = VY * log10(S * Pin / IZ)
@@ -595,7 +523,7 @@ class CoreDAQ:
             pin_w = (self._silicon_log_iz_a / resp) * (10.0 ** (float(v_volts) / self._silicon_log_vy_v_per_decade))
             return float(pin_w)
 
-        pin_w = float(self.voltage_to_power_W(float(v_volts)))
+        pin_w = float(self.voltage_to_power_W(float(v_volts), head_idx=head_idx))
         if self._detector_type == self.DETECTOR_INGAAS:
             pin_w *= self._ingaas_responsivity_correction_factor()
         return pin_w
@@ -617,12 +545,11 @@ class CoreDAQ:
             return round(p_w, decimals)
 
         slope_mV_per_W = float(self._cal_slope[head_idx][gain])
-        intercept_mV = float(self._cal_intercept[head_idx][gain])
         if slope_mV_per_W == 0.0:
             raise CoreDAQError(f"Invalid slope for head {head_idx+1}, gain {gain}")
 
         power_lsb = self.ADC_LSB_MV / abs(slope_mV_per_W)
-        p_w = (float(mv_corr) - intercept_mV) / slope_mV_per_W
+        p_w = float(mv_corr) / slope_mV_per_W
         if self._detector_type == self.DETECTOR_INGAAS:
             corr = self._ingaas_responsivity_correction_factor()
             p_w *= corr
@@ -915,90 +842,173 @@ class CoreDAQ:
                 self._cal_slope[head - 1][gain] = float(slope)
                 self._cal_intercept[head - 1][gain] = float(intercept)
 
-    def _load_log_calibration(self):
-        """
-        Pull log LUT via:
-          LOGCAL 1
+    def _normalize_head_index(self, head_idx: int, context: str = "head") -> int:
+        try:
+            idx = int(head_idx)
+        except Exception as e:
+            raise CoreDAQError(f"{context} must be 1..{self.NUM_HEADS}") from e
+        if idx < 1 or idx > self.NUM_HEADS:
+            raise CoreDAQError(f"{context} must be 1..{self.NUM_HEADS}")
+        return idx - 1
 
-        Stream:
-          OK H1 N=<n_pts> RB=<rec_bytes>
-          <binary payload n_pts*RB>
-          OK DONE
-
-        Record = little-endian <Hi:
-          uint16 V_mV
-          int32  log10P_Q16
-        """
-        with self._lock:
-            self._ser.reset_input_buffer()
-            self._writeln("LOGCAL 1")
-
-            header = None
-            for _ in range(120):
-                raw = self._ser.readline()
-                if not raw:
-                    continue
-                line = raw.decode("ascii", "ignore").strip()
-                if line.startswith("OK") and (" N=" in line) and (" RB=" in line) and (" H" in line):
-                    header = line
-                    break
-
-            if not header:
-                raise CoreDAQError("LOGCAL header not received")
-
-            parts = header.split()
-            try:
-                n_pts = int([t for t in parts if t.startswith("N=")][0].split("=", 1)[1])
-                rb = int([t for t in parts if t.startswith("RB=")][0].split("=", 1)[1])
-            except Exception:
-                raise CoreDAQError(f"Malformed LOGCAL header: {header!r}")
-
-            if rb != 6:
-                raise CoreDAQError(f"Unexpected LOGCAL RB={rb} (expected 6)")
-
-            payload_len = n_pts * rb
-            payload = self._ser.read(payload_len)
-            if len(payload) != payload_len:
-                raise CoreDAQError(f"Short LOGCAL payload: got {len(payload)} / {payload_len}")
-
-            done_ok = False
-            for _ in range(120):
-                raw = self._ser.readline()
-                if not raw:
-                    continue
-                line = raw.decode("ascii", "ignore").strip()
-                if line == "OK DONE":
-                    done_ok = True
-                    break
-            if not done_ok:
-                raise CoreDAQError("LOGCAL missing OK DONE terminator")
-
-        V_mV: List[int] = []
-        Q16: List[int] = []
-        for i in range(n_pts):
-            v, q = struct.unpack_from("<Hi", payload, i * rb)
-            V_mV.append(int(v))
-            Q16.append(int(q))
-
-        if not V_mV:
-            raise CoreDAQError("LOG LUT empty")
-
-        self._loglut_V_mV = V_mV
-        self._loglut_log10P_Q16 = Q16
-        self._loglut_V_V = [v / 1000.0 for v in V_mV]
-        self._loglut_log10P = [q / 65536.0 for q in Q16]
-
-        if len(self._loglut_V_V) != len(self._loglut_log10P):
-            raise CoreDAQError("LOG LUT length mismatch after decode")
-
-    # ---------- LOG conversion (volts -> power) ----------
-    def voltage_to_power_W(self, v_volts: NumOrSeq):
-        self._require_frontend(self.FRONTEND_LOG, "voltage_to_power_W")
-        if self._loglut_V_V is None or self._loglut_log10P is None:
+    def _get_log_lut_by_head(self, head_idx: int, context: str = "LOG LUT") -> Tuple[List[float], List[float]]:
+        i = self._normalize_head_index(head_idx, context)
+        lut = self._loglut_by_head[i] if i < len(self._loglut_by_head) else None
+        if not isinstance(lut, dict) or not isinstance(lut.get("V_V"), list) or not isinstance(lut.get("log10P"), list):
+            lut = self._loglut_by_head[0] if self._loglut_by_head else None
+        if not isinstance(lut, dict) or not isinstance(lut.get("V_V"), list) or not isinstance(lut.get("log10P"), list):
             raise CoreDAQError("LOG LUT not loaded")
 
-        xs = self._loglut_V_V
-        ys = self._loglut_log10P
+        xs = lut.get("V_V")
+        ys = lut.get("log10P")
+        if not isinstance(xs, list) or not isinstance(ys, list) or len(xs) == 0:
+            raise CoreDAQError("LOG LUT not loaded")
+        if len(xs) != len(ys):
+            raise CoreDAQError("LOG LUT length mismatch")
+        return xs, ys
+
+    def _read_log_lut_no_lock(self, head: int) -> Dict[str, object]:
+        self._ser.reset_input_buffer()
+
+        if self._inter_command_gap_s > 0.0 and self._last_command_ts > 0.0:
+            dt = time.perf_counter() - self._last_command_ts
+            if dt < self._inter_command_gap_s:
+                time.sleep(self._inter_command_gap_s - dt)
+
+        self._writeln(f"LOGCAL {head}")
+        self._last_command_ts = time.perf_counter()
+
+        header = None
+        for _ in range(120):
+            raw = self._ser.readline()
+            if not raw:
+                continue
+            line = raw.decode("ascii", "ignore").strip()
+            if line.startswith("OK") and (" N=" in line) and (" RB=" in line):
+                header = line
+                break
+
+        if not header:
+            raise CoreDAQError(f"LOGCAL header not received for head {head}")
+
+        parts = header.split()
+        n_pts = None
+        rb = None
+        for token in parts:
+            if token.startswith("N="):
+                try:
+                    n_pts = int(token.split("=", 1)[1])
+                except Exception:
+                    n_pts = None
+            elif token.startswith("RB="):
+                try:
+                    rb = int(token.split("=", 1)[1])
+                except Exception:
+                    rb = None
+
+        if n_pts is None or rb is None:
+            raise CoreDAQError(f"Malformed LOGCAL header: {header!r}")
+        if rb != 6:
+            raise CoreDAQError(f"Unexpected LOGCAL RB={rb} (expected 6)")
+
+        payload_len = n_pts * rb
+        payload = self._ser.read(payload_len)
+        if len(payload) != payload_len:
+            raise CoreDAQError(f"Short LOGCAL payload: got {len(payload)} / {payload_len}")
+
+        done_ok = False
+        for _ in range(120):
+            raw = self._ser.readline()
+            if not raw:
+                continue
+            line = raw.decode("ascii", "ignore").strip()
+            if line == "OK DONE":
+                done_ok = True
+                break
+        if not done_ok:
+            raise CoreDAQError("LOGCAL missing OK DONE terminator")
+
+        v_mV: List[int] = []
+        q16: List[int] = []
+        for i in range(n_pts):
+            v, q = struct.unpack_from("<Hi", payload, i * rb)
+            v_mV.append(int(v))
+            q16.append(int(q))
+
+        header_head = int(head)
+        m = re.search(r"(?:^|\s)H=?([0-9]+)", header, flags=re.IGNORECASE)
+        if m:
+            try:
+                header_head = int(m.group(1))
+            except Exception:
+                header_head = int(head)
+
+        return {
+            "requestedHead": int(head),
+            "headerHead": int(header_head),
+            "V_mV": v_mV,
+            "log10P_Q16": q16,
+        }
+
+    def _load_log_calibration(self):
+        with self._lock:
+            loaded: List[Optional[Dict[str, object]]] = [None] * self.NUM_HEADS
+            ch1: Optional[Dict[str, object]] = None
+
+            for head in range(1, self.NUM_HEADS + 1):
+                try:
+                    one = self._read_log_lut_no_lock(head)
+                except Exception as e:
+                    if head == 1 or ch1 is None:
+                        raise
+                    warnings.warn(
+                        f"LOGCAL head {head} unavailable; reusing head 1 LUT ({e})",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    one = {
+                        "requestedHead": int(head),
+                        "headerHead": int(ch1.get("headerHead", 1)),
+                        "V_mV": list(ch1.get("V_mV", [])),
+                        "log10P_Q16": list(ch1.get("log10P_Q16", [])),
+                    }
+
+                loaded[head - 1] = one
+                if head == 1:
+                    ch1 = one
+
+        for h in range(self.NUM_HEADS):
+            row = loaded[h] if loaded[h] is not None else loaded[0]
+            if row is None:
+                raise CoreDAQError(f"LOG LUT empty for head {h + 1}")
+
+            v_mV = [int(v) for v in row.get("V_mV", [])]  # type: ignore[arg-type]
+            q16 = [int(v) for v in row.get("log10P_Q16", [])]  # type: ignore[arg-type]
+            if len(v_mV) == 0:
+                raise CoreDAQError(f"LOG LUT empty for head {h + 1}")
+
+            v_v = [float(v) / 1000.0 for v in v_mV]
+            log10p = [float(q) / 65536.0 for q in q16]
+            if len(v_v) != len(log10p):
+                raise CoreDAQError(f"LOG LUT length mismatch for head {h + 1}")
+
+            self._loglut_by_head[h] = {
+                "V_mV": v_mV,
+                "log10P_Q16": q16,
+                "V_V": v_v,
+                "log10P": log10p,
+            }
+
+        ch1_lut = self._loglut_by_head[0]
+        self._loglut_V_mV = list(ch1_lut["V_mV"])
+        self._loglut_log10P_Q16 = list(ch1_lut["log10P_Q16"])
+        self._loglut_V_V = list(ch1_lut["V_V"])
+        self._loglut_log10P = list(ch1_lut["log10P"])
+
+    # ---------- LOG conversion (volts -> power) ----------
+    def voltage_to_power_W(self, v_volts: NumOrSeq, head_idx: int = 1):
+        self._require_frontend(self.FRONTEND_LOG, "voltage_to_power_W")
+        xs, ys = self._get_log_lut_by_head(head_idx, "voltage_to_power_W")
 
         def interp_one(x: float) -> float:
             if x <= xs[0]:
@@ -1140,7 +1150,7 @@ class CoreDAQ:
                     out.append(0.0)
                     continue
                 v = mv_corr / 1000.0
-                p_w = self._convert_log_voltage_to_power_w(v)
+                p_w = self._convert_log_voltage_to_power_w(v, ch + 1)
                 out.append(round(p_w, self.POWER_OUTPUT_DECIMALS_MAX))
             return out
 
@@ -1493,124 +1503,57 @@ class CoreDAQ:
         self,
         frames: int,
         use_zero: Optional[bool] = None,          # kept for compatibility; ignored
-        log_deadband_mV: Optional[float] = None,
-        use_numpy: Optional[bool] = True
+        log_deadband_mV: Optional[float] = None
     ) -> List[List[float]]:
         """
         Transfers frames and converts to optical power in watts per channel.
-        Fast path: requires NumPy, uses cached conversion constants.
+
+        LINEAR:
+          - reads GAINS? once (assumes fixed during acquisition)
+          - INGAAS: applies per-head, per-gain slope/intercept (+ wavelength correction)
+          - SILICON: uses TIA gain model + Si responsivity curve
+
+        LOG:
+          - INGAAS: ADC -> volts -> LUT -> watts (+ wavelength correction)
+          - SILICON: ADL5303 model with Si responsivity curve
+          - optional deadband in mV (log_deadband_mV or configured default)
         """
         if frames <= 0:
             raise ValueError("frames must be > 0")
 
-        if not _HAS_NUMPY:
-            raise CoreDAQError("NumPy is required for transfer_frames_W fast path")
-
-        _ = use_numpy  # keep API compatibility
-
         if self._frontend_type == self.FRONTEND_LINEAR:
-            ch = self.transfer_frames_adc(frames)
+            mv_ch = self.transfer_frames_mV(frames, use_zero=None)
             gains = self.get_gains()
-            power_ch = []
+            power_ch: List[List[float]] = [[], [], [], []]
 
-            if self._detector_type == self.DETECTOR_INGAAS:
-                corr = float(self._fast_linear_corr)
-                for ch_idx in range(4):
-                    gain = int(gains[ch_idx])
-                    slope = float(self._fast_linear_slope[ch_idx][gain])
-                    intercept = float(self._fast_linear_intercept[ch_idx][gain])
-                    power_lsb = float(self._fast_linear_power_lsb[ch_idx][gain])
-                    decimals = int(self._fast_linear_decimals[ch_idx][gain])
+            for ch_idx in range(4):
+                gain = int(gains[ch_idx])
 
-                    if slope == 0.0:
-                        raise CoreDAQError(f"Invalid slope for head {ch_idx+1}, gain {gain}")
+                out_list = power_ch[ch_idx]
+                for mv_val in mv_ch[ch_idx]:
+                    out_list.append(self._convert_linear_mv_to_power_w(ch_idx, gain, float(mv_val)))
 
-                    codes = np.asarray(ch[ch_idx], dtype=np.float64)
-                    mv_corr = (codes - float(self._linear_zero_adc[ch_idx])) * self.ADC_LSB_MV
-                    if self._mv_zero_threshold > 0.0:
-                        mv_corr[np.abs(mv_corr) < float(self._mv_zero_threshold)] = 0.0
-
-                    p_w = (mv_corr - intercept) / slope
-                    if corr != 1.0:
-                        p_w *= corr
-
-                    if power_lsb > 0.0:
-                        p_w = np.round(p_w / power_lsb) * power_lsb
-                    p_w = np.round(p_w, decimals)
-                    power_ch.append(p_w.tolist())
-
-                return power_ch
-
-            if self._detector_type == self.DETECTOR_SILICON:
-                resp = float(self._fast_silicon_resp)
-                for ch_idx in range(4):
-                    gain = int(gains[ch_idx])
-                    tia = float(self._silicon_linear_tia_ohm[ch_idx][gain])
-                    power_lsb = float(self._fast_linear_power_lsb[ch_idx][gain])
-                    decimals = int(self._fast_linear_decimals[ch_idx][gain])
-
-                    if resp <= 0.0 or tia <= 0.0:
-                        raise CoreDAQError(f"Invalid silicon model at head {ch_idx+1}, gain {gain}")
-
-                    codes = np.asarray(ch[ch_idx], dtype=np.float64)
-                    mv_corr = (codes - float(self._linear_zero_adc[ch_idx])) * self.ADC_LSB_MV
-                    if self._mv_zero_threshold > 0.0:
-                        mv_corr[np.abs(mv_corr) < float(self._mv_zero_threshold)] = 0.0
-
-                    p_w = (mv_corr / 1000.0) / (tia * resp)
-                    if power_lsb > 0.0:
-                        p_w = np.round(p_w / power_lsb) * power_lsb
-                    p_w = np.round(p_w, decimals)
-                    power_ch.append(p_w.tolist())
-
-                return power_ch
-
-            raise CoreDAQError(f"Unknown detector type: {self._detector_type}")
+            return power_ch
 
         if self._frontend_type == self.FRONTEND_LOG:
-            ch = self.transfer_frames_adc(frames)
+            v_ch = self.transfer_frames_volts(frames, use_zero=None)
             db = self._log_deadband_mV if log_deadband_mV is None else float(log_deadband_mV)
-            power_ch = []
 
-            if self._detector_type == self.DETECTOR_SILICON:
-                resp = float(self._fast_silicon_resp)
-                if resp <= 0.0:
-                    raise CoreDAQError("Invalid silicon responsivity")
-
-                for ch_idx in range(4):
-                    mv = np.asarray(ch[ch_idx], dtype=np.float64) * self.ADC_LSB_MV
-                    if db > 0.0:
-                        mv[np.abs(mv) < db] = 0.0
-                    v = mv / 1000.0
-                    p_w = (self._silicon_log_iz_a / resp) * (10.0 ** (v / self._silicon_log_vy_v_per_decade))
-                    p_w = np.round(p_w, self.POWER_OUTPUT_DECIMALS_MAX)
-                    power_ch.append(p_w.tolist())
-                return power_ch
-
-            if self._detector_type == self.DETECTOR_INGAAS:
-                xs = self._fast_loglut_V
-                ys = self._fast_loglut_log10P
-                if xs is None or ys is None:
-                    raise CoreDAQError("LOG LUT not loaded")
-
-                corr = float(self._fast_log_corr)
-                for ch_idx in range(4):
-                    mv = np.asarray(ch[ch_idx], dtype=np.float64) * self.ADC_LSB_MV
-                    if db > 0.0:
-                        mv[np.abs(mv) < db] = 0.0
-                    v = mv / 1000.0
-                    y = np.interp(v, xs, ys)
-                    p_w = np.power(10.0, y)
-                    if corr != 1.0:
-                        p_w *= corr
-                    p_w = np.round(p_w, self.POWER_OUTPUT_DECIMALS_MAX)
-                    power_ch.append(p_w.tolist())
-                return power_ch
-
-            raise CoreDAQError(f"Unknown detector type: {self._detector_type}")
+            power_ch: List[List[float]] = [[], [], [], []]
+            for ch_idx in range(4):
+                out_list = power_ch[ch_idx]
+                for v in v_ch[ch_idx]:
+                    mv_equiv = v * 1e3
+                    if db > 0.0 and abs(mv_equiv) < db:
+                        out_list.append(0.0)
+                    else:
+                        p_w = self._convert_log_voltage_to_power_w(float(v), ch_idx + 1)
+                        out_list.append(round(p_w, self.POWER_OUTPUT_DECIMALS_MAX))
+            return power_ch
 
         raise CoreDAQError(f"Unknown frontend type: {self._frontend_type}")
 
+    # ---------- Misc / settings ----------
     def stream_write_address(self) -> int:
         st, p = self._ask("ADDR?")
         if st != "OK":
@@ -1807,5 +1750,6 @@ class CoreDAQ:
                     found.append(p.device)
 
         return found
+
 
 
